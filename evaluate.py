@@ -1,46 +1,16 @@
-# evaluate.py
-
-import glob
-import json
+import argparse
 import math
-import os
-import sys
 
 import torch
 import torch.nn as nn
-import yaml
-
-sys.path.append(os.path.dirname(__file__))
 
 from src.data_loader import get_dataloader
-from src.model.lemma_decoder import LemmaDecoder
-from src.model.morph_decoder import MorphDecoder
-from src.model.quantum_embedding import QuantumEmbedding
-from src.model.transformer_core import TransformerCore
-from src.utils import build_vocab_sizes, find_latest_checkpoint, load_config, set_seed
+from src.runtime import build_model, load_bundle_checkpoint, load_runtime_config, resolve_device
+from src.utils import find_latest_checkpoint, set_seed
 
 
-def evaluate(
-    embedding: nn.Module,
-    transformer: nn.Module,
-    lemma_decoder: LemmaDecoder,
-    morph_decoder: MorphDecoder,
-    dataloader: torch.utils.data.DataLoader,
-    lemma_criterion: nn.CrossEntropyLoss,
-    morph_criterion: nn.CrossEntropyLoss,
-    pad_idx: int,
-    device: torch.device,
-) -> None:
-    """
-    Прогон по тестовому датасету, вычисление:
-      - среднего лосса и перплексии для next-lemma prediction,
-      - точности предсказания лемм,
-      - среднего лосса и точности для морфологического декодера.
-    """
-    embedding.eval()
-    transformer.eval()
-    lemma_decoder.eval()
-    morph_decoder.eval()
+def evaluate_bundle(bundle, dataloader, lemma_criterion, morph_criterion, pad_idx, device):
+    bundle.eval()
 
     total_lemma_loss = 0.0
     total_morph_loss = 0.0
@@ -50,77 +20,76 @@ def evaluate(
     correct_morphs = 0
 
     with torch.no_grad():
-        for lemma_ids, morph_ids, lengths in dataloader:
+        for lemma_ids, morph_ids, _ in dataloader:
             lemma_ids = lemma_ids.to(device)
             morph_ids = morph_ids.to(device)
             padding_mask = lemma_ids.eq(pad_idx)
 
-            psi, _ = embedding(lemma_ids)
-            contextual = transformer(psi, padding_mask)
+            psi, _ = bundle.embedding(lemma_ids)
+            contextual = bundle.transformer(psi, padding_mask)
 
-            lemma_logits = lemma_decoder(contextual)
-            B, S, V = lemma_logits.shape
-
-            pred_logits = lemma_logits[:, :-1, :].contiguous().view(-1, V)
+            lemma_logits = bundle.lemma_decoder(contextual)
+            _, _, lemma_vocab = lemma_logits.shape
+            pred_logits = lemma_logits[:, :-1, :].contiguous().view(-1, lemma_vocab)
             lemma_targets = lemma_ids[:, 1:].contiguous().view(-1)
 
-            loss_lemma = lemma_criterion(pred_logits, lemma_targets)
-            mask_lem = lemma_targets != pad_idx
-            n_lem_tokens = mask_lem.sum().item()
+            lemma_loss = lemma_criterion(pred_logits, lemma_targets)
+            lemma_mask = lemma_targets != pad_idx
+            lemma_tokens = lemma_mask.sum().item()
+            total_lemma_loss += lemma_loss.item() * lemma_tokens
+            total_lemma_tokens += lemma_tokens
 
-            total_lemma_loss += loss_lemma.item() * n_lem_tokens
-            total_lemma_tokens += n_lem_tokens
-
-            preds = pred_logits.argmax(dim=-1)
+            lemma_preds = pred_logits.argmax(dim=-1)
             correct_lemmas += (
-                (preds == lemma_targets).masked_select(mask_lem).sum().item()
+                (lemma_preds == lemma_targets).masked_select(lemma_mask).sum().item()
             )
 
-            morph_logits = morph_decoder(contextual)
-            _, _, M = morph_logits.shape
-
-            morph_logits_flat = morph_logits.view(-1, M)
+            morph_logits = bundle.morph_decoder(contextual)
+            _, _, morph_vocab = morph_logits.shape
+            morph_logits_flat = morph_logits.view(-1, morph_vocab)
             morph_targets = morph_ids.view(-1)
 
-            loss_morph = morph_criterion(morph_logits_flat, morph_targets)
-            mask_morph = morph_targets != pad_idx
-            n_morph_tokens = mask_morph.sum().item()
+            morph_loss = morph_criterion(morph_logits_flat, morph_targets)
+            morph_mask = morph_targets != pad_idx
+            morph_tokens = morph_mask.sum().item()
+            total_morph_loss += morph_loss.item() * morph_tokens
+            total_morph_tokens += morph_tokens
 
-            total_morph_loss += loss_morph.item() * n_morph_tokens
-            total_morph_tokens += n_morph_tokens
-
-            preds_morph = morph_logits_flat.argmax(dim=-1)
+            morph_preds = morph_logits_flat.argmax(dim=-1)
             correct_morphs += (
-                (preds_morph == morph_targets).masked_select(mask_morph).sum().item()
+                (morph_preds == morph_targets).masked_select(morph_mask).sum().item()
             )
 
-    avg_lemma_loss = total_lemma_loss / total_lemma_tokens
-    avg_morph_loss = total_morph_loss / total_morph_tokens
-    perplexity = math.exp(avg_lemma_loss)
-    lemma_accuracy = correct_lemmas / total_lemma_tokens * 100
-    morph_accuracy = correct_morphs / total_morph_tokens * 100
+    avg_lemma_loss = total_lemma_loss / max(total_lemma_tokens, 1)
+    avg_morph_loss = total_morph_loss / max(total_morph_tokens, 1)
+    return {
+        "lemma_loss": avg_lemma_loss,
+        "perplexity": math.exp(avg_lemma_loss),
+        "lemma_accuracy": correct_lemmas / max(total_lemma_tokens, 1) * 100,
+        "morph_loss": avg_morph_loss,
+        "morph_accuracy": correct_morphs / max(total_morph_tokens, 1) * 100,
+    }
 
-    print("Evaluation results:")
-    print(f"  Next-lemma loss      : {avg_lemma_loss:.4f}")
-    print(f"  Next-lemma perplexity: {perplexity:.2f}")
-    print(
-        f"  Next-lemma accuracy  : {lemma_accuracy:.2f}% ({correct_lemmas}/{total_lemma_tokens})"
-    )
-    print(f"  Morph loss           : {avg_morph_loss:.4f}")
-    print(
-        f"  Morph accuracy       : {morph_accuracy:.2f}% ({correct_morphs}/{total_morph_tokens})"
-    )
+
+def print_metrics(metrics, model_type):
+    print(f"model={model_type}")
+    print(f"  next-lemma loss      : {metrics['lemma_loss']:.4f}")
+    print(f"  next-lemma perplexity: {metrics['perplexity']:.2f}")
+    print(f"  next-lemma accuracy  : {metrics['lemma_accuracy']:.2f}%")
+    print(f"  morph loss           : {metrics['morph_loss']:.4f}")
+    print(f"  morph accuracy       : {metrics['morph_accuracy']:.2f}%")
 
 
 def main():
-    config = load_config("config/config_books.yaml")
-    set_seed(config.get("seed", 42))
+    parser = argparse.ArgumentParser(description="evaluate model")
+    parser.add_argument("--config", type=str, default="config/config_books.yaml")
+    parser.add_argument("--model-type", type=str, default="qmorph", choices=["qmorph", "baseline"])
+    parser.add_argument("--checkpoint", type=str, default=None)
+    args = parser.parse_args()
 
-    device = torch.device(
-        "cuda"
-        if config["training"]["device"] == "cuda" and torch.cuda.is_available()
-        else "cpu"
-    )
+    config = load_runtime_config(args.config)
+    set_seed(config.get("seed", 42))
+    device = resolve_device(config)
 
     test_loader = get_dataloader(
         data_file=config["data"]["test_file"],
@@ -132,71 +101,21 @@ def main():
         num_workers=0,
     )
 
-    lemma_vocab_path = config["vocab"]["lemma_vocab"]
-    morph_vocab_path = config["vocab"]["morph_vocab"]
-    vocab_size, morph_vocab_size = build_vocab_sizes(lemma_vocab_path, morph_vocab_path)
+    bundle = build_model(config, model_type=args.model_type).to(device)
 
-    emb_cfg = config["model"]["quantum_embedding"]
-    embedding = QuantumEmbedding(
-        vocab_size=vocab_size,
-        embed_dim=emb_cfg["embed_dim"],
-        n_senses=emb_cfg["n_senses"],
-        pad_idx=emb_cfg["pad_idx"],
-    ).to(device)
-
-    trf_cfg = config["model"]["transformer"]
-    transformer = TransformerCore(
-        embed_dim=trf_cfg["embed_dim"],
-        num_heads=trf_cfg["num_heads"],
-        ff_dim=trf_cfg["ff_dim"],
-        num_layers=trf_cfg["num_layers"],
-        dropout=trf_cfg["dropout"],
-        max_seq_len=trf_cfg["max_seq_len"],
-        is_autoregressive=True,
-    ).to(device)
-
-    ld_cfg = config["model"]["lemma_decoder"]
-    lemma_decoder = LemmaDecoder(
-        embed_dim=ld_cfg["embed_dim"],
-        vocab_size=vocab_size,
-        pad_idx=ld_cfg["pad_idx"],
-        dropout=ld_cfg["dropout"],
-    ).to(device)
-
-    dec_cfg = config["model"]["morph_decoder"]
-    morph_decoder = MorphDecoder(
-        embed_dim=dec_cfg["embed_dim"],
-        morph_vocab_size=morph_vocab_size,
-        form_mapping_file=dec_cfg["form_mapping"],
-        dropout=dec_cfg["dropout"],
-        pad_idx=dec_cfg["pad_idx"],
-    ).to(device)
-
-    ckpt_path = find_latest_checkpoint(
-        config["checkpoint"]["dir"], config["checkpoint"]["prefix"]
+    checkpoint = args.checkpoint or find_latest_checkpoint(
+        config["checkpoint"]["dir"], f"{args.model_type}_model"
     )
-    print(f"Loading checkpoint: {ckpt_path}")
-    ckpt = torch.load(ckpt_path, map_location=device)
-    embedding.load_state_dict(ckpt["embedding_state"])
-    transformer.load_state_dict(ckpt["transformer_state"])
-    lemma_decoder.load_state_dict(ckpt["lemma_decoder_state"])
-    morph_decoder.load_state_dict(ckpt["morph_decoder_state"])
+    load_bundle_checkpoint(bundle, checkpoint, device)
 
-    pad_idx = emb_cfg["pad_idx"]
-    lemma_criterion = nn.CrossEntropyLoss(ignore_index=pad_idx)
+    pad_idx = config["model"]["morph_decoder"]["pad_idx"]
+    lemma_criterion = nn.CrossEntropyLoss(ignore_index=config["model"]["lemma_decoder"]["pad_idx"])
     morph_criterion = nn.CrossEntropyLoss(ignore_index=pad_idx)
 
-    evaluate(
-        embedding,
-        transformer,
-        lemma_decoder,
-        morph_decoder,
-        test_loader,
-        lemma_criterion,
-        morph_criterion,
-        pad_idx,
-        device,
+    metrics = evaluate_bundle(
+        bundle, test_loader, lemma_criterion, morph_criterion, pad_idx, device
     )
+    print_metrics(metrics, args.model_type)
 
 
 if __name__ == "__main__":
