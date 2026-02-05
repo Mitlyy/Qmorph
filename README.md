@@ -1,70 +1,55 @@
-
 # QMorph
 
-**QMorph** — генеративная NLP-модель на русском языке, сочетающая квантово-вдохновлённые эмбеддинги и морфологическую лемматизацию. Поддерживает как литературную генерацию текста, так и режим чат-бота.
+**QMorph** — генеративная NLP-модель на русском языке с морфологической декомпозицией и квантово-вдохновлёнными эмбеддингами.
 
----
+## установка
 
-### Установка зависимостей
 `python == 3.9.*`
-```bash
-pip install -r requirements.txt && 
-./download_and_extract.sh 
-```
-
-### Инференс (текстовая генерация)
 
 ```bash
-python inference.py --sentence "Я посмотрел на это создание,"
+pip install -r requirements.txt
 ```
 
-### Инференс (чат-бот)
+## обучение
+
+обучить только qmorph:
 
 ```bash
-python inference_chat.py
+./scripts/train_qmorph.sh config/config_books.yaml
 ```
 
----
-
-## Обучение
-
-### Предобучение на литературном корпусе:
+обучить baseline + qmorph:
 
 ```bash
-python split_book_enchanced.py "--input_dir" "books/"&&
-python src/preprocessing/vocab_builder.py --train_file "data/data/train.txt" --output_dir "/vocabs/vocab_books" &&
-python train.py
+./scripts/train_all_models.sh config/config_books.yaml
 ```
 
-### Донастройка на диалоговом корпусе:
+## инференс
+
+инференс только qmorph:
 
 ```bash
-python split_chats.py "chats/result.txt" --out_dir "data/data_chat_2" && 
-mkdir vocabs/vocab_chat && cp /vocabs/vocab_books/*.json vocabs/vocab_chat &&
-python train_chat.py
-```
---- 
-## Примеры генерации 
-Результаты после обучения на 7мб данных (3 книги и 2 сборника романов Герберта Уэльса)
-```
->>> Input tokens       : ['я', 'посмотрел', 'на', 'это', 'создание', ',']
->>> Generated lemma IDs: [26379, 16961, 10989, 26325, 21692, 6, 12666, 23478, 5978, 3528, 8327, 7346, 25620, 13641, 8, 13641, 22366, 6, 4447, 26379, 2308, 9735, 6, 21473, 10989, 13641, 8, 13641, 3586, 5930, 
-2029, 26478, 26379, 11694, 7272, 6, 25620, 21361, 6, 7346, 4484, 6, 25620, 13641, 11694, 25157, 6, 26478, 7346, 5774]
->>> Output sentence    : я посмотрел на это создание , но тут же вспомнил кейвора и что он . он стоял , глядя мне в лицо , смотрит на него . он все еще боялся – я не знал , что случилось , и говорил , что он
- не хочет , – и думал
+./scripts/infer_qmorph.sh "Я посмотрел на это создание,"
 ```
 
+инференс baseline + qmorph:
 
+```bash
+./scripts/infer_all_models.sh "Я посмотрел на это создание,"
 ```
-User: Привет
-Bot: я не могу , я не могу .
-User: Чего ты так 
-Bot: да , я не знаю , что ты хочешь .
-User: Пить будешь?)
-Bot: да , конечно .
-User: Ахаха, хорош, за твое здоровье!
-Bot: а ты что , не можешь ?
-User: Я сок попью 
-Bot: я тоже
-User: 
+
+## сравнение моделей
+
+скрипт считает метрики на тесте для baseline и qmorph, пишет отчёт в `reports/model_comparison.json`:
+
+```bash
+./scripts/compare_models.sh config/config_books.yaml
+```
+
+критерий победителя — меньшая perplexity по задаче next-lemma.
+
+## тесты
+
+```bash
+python -m unittest discover -s tests -v
 ```
